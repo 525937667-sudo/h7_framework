@@ -17,11 +17,8 @@ int main(int argc, char **argv)
   unsigned interval = second_time - first_time;
   rewind(file);
   SysidConfig config = {.sampling_time = 0.004f, .window_time = 0.048f,
-                        .current_scale = 0.3f, .omega_scale = 8.0f,
-                        .position_harmonics = {10.0f, 20.0f, 36.0f}};
+                        .current_scale = 0.3f, .omega_scale = 8.0f};
   config.sampling_time = 0.001f * (float)interval;
-  if (argc > 2 && strcmp(argv[2], "--basic") == 0)
-    memset(config.position_harmonics, 0, sizeof(config.position_harmonics));
   static SysidObject sysid;
   SysidModel model;
   if (!SysidInit(&sysid, &config)) return 2;
@@ -41,12 +38,12 @@ int main(int argc, char **argv)
     }
     previous_time = time;
     samples++;
-    (void)SysidUpdateWithPosition(&sysid, current, omega, position);
+    (void)SysidUpdate(&sysid, current, omega);
   }
   fclose(file);
   int valid = SysidGetModel(&sysid, &model);
-  printf("valid=%d count=%u held_out=%u M=%.9g B=%.9g F=%.9g fit=%.6f\n",
-          valid, model.count, sysid.validation_count, model.inertia,
+  printf("valid=%d count=%u rejected=%u M=%.9g B=%.9g F=%.9g fit=%.6f\n",
+          valid, model.count, sysid.rejected_windows, model.inertia,
           model.viscous, model.friction, model.fitness);
   return valid ? 0 : 1;
 }

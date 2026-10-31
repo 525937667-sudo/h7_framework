@@ -6,6 +6,13 @@
 #define MOTOR_TUNE_MAX_CANDIDATES 27U
 #define MOTOR_TUNE_HOLD_POINTS 3U
 
+#define MOTOR_TUNE_OBJECTIVE_ERROR (1U << 0)
+#define MOTOR_TUNE_OBJECTIVE_OVERSHOOT (1U << 1)
+#define MOTOR_TUNE_OBJECTIVE_SETTLING (1U << 2)
+#define MOTOR_TUNE_OBJECTIVE_RIPPLE (1U << 3)
+#define MOTOR_TUNE_OBJECTIVE_SLEW (1U << 4)
+#define MOTOR_TUNE_OBJECTIVE_SATURATION (1U << 5)
+
 // 单电机性能整定状态
 typedef enum
 {
@@ -29,9 +36,7 @@ typedef enum
   kMotorTuneIdentificationFailed,
   kMotorTuneOutputMissing,
   kMotorTunePrepareTimeout,
-  kMotorTuneNoFeasibleCandidate,
-  kMotorTuneBaselineValidationFailed,
-  kMotorTuneOscillationDetected
+  kMotorTuneNoFeasibleCandidate
 } MotorTuneError;
 
 // 候选参数测试结果
@@ -41,32 +46,15 @@ typedef enum
   kMotorTuneInvalidDesign,
   kMotorTuneRejected,
   kMotorTuneValidationRejected,
-  kMotorTuneVerified,
-  kMotorTuneDynamicLimit,
-  kMotorTuneResponseAborted
+  kMotorTuneVerified
 } MotorTuneCandidateState;
 
-typedef enum
-{
-  kMotorTuneRejectRms = 1U << 0,
-  kMotorTuneRejectOvershoot = 1U << 1,
-  kMotorTuneRejectUnsettled = 1U << 2,
-  kMotorTuneRejectSettlingTime = 1U << 3,
-  kMotorTuneRejectRipple = 1U << 4,
-  kMotorTuneRejectSlew = 1U << 5,
-  kMotorTuneRejectSaturation = 1U << 6,
-  kMotorTuneRejectTrackingEnvelope = 1U << 7,
-  kMotorTuneRejectOscillation = 1U << 8,
-  kMotorTuneRejectDynamicLimit = 1U << 9,
-  kMotorTuneRejectInvalidDesign = 1U << 10
-} MotorTuneRejection;
-
-// 等间隔物理参数搜索范围
+// 物理参数搜索范围
 typedef struct
 {
   float lower;
   float upper;
-  uint8_t count; // 1至3，单点时上下限相同
+  uint8_t count; // 1至3，1表示固定，乘积作为默认测试预算
 } MotorTuneRange;
 
 // 实测性能结构体
@@ -78,9 +66,7 @@ typedef struct
   float idle_ripple;   // 保持误差的最大标准差（rad/s或rad）
   float rms_slew;      // 最终电流指令变化率均方根（A/s）
   float saturation;    // 内部饱和或外部分配受限的采样比例
-  bool settled;        // 所有保持段的末端均稳定
-  uint8_t worst_overshoot_segment; // 最大正超调所在轨迹段，0至15
-  uint16_t unstable_segments; // 每位对应一个保持段，1表示末端未稳定
+  bool settled;        // 所有非零目标变化均在窗口末尾稳定
 } MotorTuneMetrics;
 
 // 期望性能上限，0表示不约束对应指标
@@ -102,11 +88,14 @@ typedef struct
   MotorTuneRange damping;     // 阻尼比
   MotorTuneRange feedforward; // 加速度前馈比例，0至1.5
   MotorTuneLimits limits;
-  float speed_amplitude;    // 速度测试最大目标（rad/s）
-  float position_amplitude; // 位置测试幅度（rad），速度模式不使用
-  float segment_time;       // 单个运动/保持段时长（s）
-  float settling_band;      // 稳定带相对测试幅度的比例，0至0.5
-  float low_speed_ratio;    // 低速目标/测试幅度，0沿用0.12，非零允许0.05至0.5
+  float speed_amplitude;                // 速度测试最大目标（rad/s）
+  float position_amplitude;             // 位置测试幅度（rad），速度模式不使用
+  float segment_time;                   // 单个运动/保持段时长（s）
+  float settling_band;                  // 稳定带相对测试幅度的比例，0至0.5
+  MotorTuneLimits comparison_tolerance; // 指标比较容差，单位与对应指标一致
+  uint8_t objectives;         // 帕累托目标位掩码，0使用误差和电流变化率
+  uint8_t search_budget;      // 候选预算，0使用三个count的乘积，上限27
+  uint8_t validation_repeats; // 独立验证次数，0使用2次，上限3
 } MotorTuneConfig;
 
 // 保持位置与实测电流
@@ -147,8 +136,7 @@ typedef struct
   MotorTuneMetrics training;
   MotorTuneMetrics validation;
   MotorTuneCandidateState state;
-  uint8_t completed_segments; // Most recent training/validation stage, 0..16.
-  uint16_t rejection_reasons; // MotorTuneRejection bitmask; partial runs cannot pass.
+  uint8_t validation_runs;
 } MotorTuneCandidate;
 
 // 有限测试集中的帕累托结果
@@ -183,7 +171,6 @@ typedef struct
   float requested_current;
   float executed_current;
   float previous_current;
-  float load_current;
   float reference;
   float target;
   float previous_target;
@@ -203,29 +190,11 @@ typedef struct
   uint32_t limited_samples;
   uint8_t segment;
   uint8_t candidate_index;
+  uint8_t search_round;
   bool position_test;
   bool pending;
   bool tracked;
   bool initialized;
-  float guard_elapsed;
-  float guard_sum_speed_error;
-  float guard_sum_current_slew;
-  float guard_previous_current;
-  float guard_rms_speed_error;
-  float guard_rms_current_slew;
-  uint32_t guard_samples;
-  uint16_t guard_reversals;
-  int8_t guard_slew_sign;
-  MotorTuneState guard_state;
-  uint8_t guard_candidate;
-  uint8_t guard_segment;
-  float last_position;
-  float last_omega;
-  float last_current;
-  MotorTuneState stop_state; // Active phase immediately before terminal failure.
-  float prepare_reference;
-  float prepare_zero_time;
-  bool prepare_braking;
 } MotorTuneObject;
 
 bool MotorTuneInit(MotorTuneObject *tune, const MotorTuneConfig *config);
@@ -237,8 +206,5 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
 bool MotorTuneTrackOutput(MotorTuneObject *tune, float executed_current);
 bool MotorTuneExport(const MotorTuneObject *tune, uint8_t pareto_index,
                      PidConfig *speed, PidConfig *position);
-bool MotorTuneExportController(const MotorTuneObject *tune, uint8_t pareto_index,
-                               PidConfig *speed, PidConfig *position,
-                               SysidModel *load_model);
 
 #endif // ALG_MOTOR_TUNE_H

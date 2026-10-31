@@ -58,19 +58,22 @@ static void AutotunePhase(AutotuneObject *tune, AutotuneState state)
  * @param tune 整定对象指针
  * @param memory_time 递推记忆时间（s）
  */
-static bool AutotuneIdentifyInit(AutotuneObject *tune, float memory_time)
+static void AutotuneIdentifyInit(AutotuneObject *tune, float memory_time)
 {
-  SysidConfig config = {.sampling_time = tune->config.sampling_time,
-                        .window_time = tune->config.identification_window_time > 0.0f
-                            ? tune->config.identification_window_time
-                            : fmaxf(0.02f, 4.0f * tune->config.sampling_time),
-                        .current_scale = tune->config.current_limit,
-                        .omega_scale = tune->config.speed_limit,
-                        .memory_time = memory_time,
-                        .method = tune->config.identification};
-  for (uint8_t h = 0U; h < SYSID_MAX_POSITION_HARMONICS; h++)
-    config.position_harmonics[h] = tune->config.identification_position_harmonics[h];
-  return SysidInit(&tune->sysid, &config) && SysidInit(&tune->rotor_sysid, &config);
+  SysidConfig config = {
+      .sampling_time = tune->config.sampling_time,
+      .window_time = tune->config.identification_window > 0.0f
+                         ? tune->config.identification_window
+                         : fmaxf(0.02f, 4.0f * tune->config.sampling_time),
+      .current_scale = tune->config.current_limit,
+      .omega_scale = tune->config.speed_limit,
+      .memory_time = memory_time,
+      .method = tune->config.identification,
+      .minimum_speed = tune->config.identification_min_speed,
+      .current_delay_samples =
+          tune->config.identification_current_delay_samples};
+  (void)SysidInit(&tune->sysid, &config);
+  (void)SysidInit(&tune->rotor_sysid, &config);
 }
 
 /**
@@ -82,14 +85,8 @@ static void AutotuneDesign(AutotuneObject *tune, float bandwidth)
 {
   float inertia = tune->result.model.inertia;
   float viscous = tune->result.model.viscous;
-  float damping = tune->config.speed_damping > 0.0f ? tune->config.speed_damping : 1.0f;
-  // Natural frequency alone does not bound proportional feedback when zeta
-  // increases. Leave a conservative sampling margin; this is not a proof of
-  // stability for an unmodelled current loop or communication delay.
-  bandwidth = fminf(bandwidth, (0.3f / tune->config.sampling_time + viscous / inertia) /
-                                  (2.0f * damping));
-  float kp =
-      fmaxf(2.0f * damping * bandwidth * inertia - viscous, 0.1f * bandwidth * inertia);
+  float kp = fmaxf(2.0f * tune->damping * bandwidth * inertia - viscous,
+                   0.1f * bandwidth * inertia);
   float ki = inertia * bandwidth * bandwidth;
   tune->result.bandwidth = bandwidth;
   tune->result.speed_kp = kp;
@@ -110,8 +107,8 @@ static void AutotuneGainScale(AutotuneObject *tune, const PidObject *speed)
 {
   float bandwidth = tune->result.bandwidth;
   float inertia = tune->result.model.inertia;
-  float damping = tune->config.speed_damping > 0.0f ? tune->config.speed_damping : 1.0f;
-  float kp = fmaxf(2.0f * damping * bandwidth * inertia - tune->result.model.viscous,
+  float kp = fmaxf(2.0f * tune->damping * bandwidth * inertia -
+                       tune->result.model.viscous,
                    0.1f * bandwidth * inertia);
   tune->gain_scale[0] = speed->kp / kp;
   tune->gain_scale[1] = speed->ki / (inertia * bandwidth * bandwidth);
@@ -135,14 +132,72 @@ static void AutotunePrime(AutotuneObject *tune, float position, float omega)
   float current = tune->result.model.viscous * omega +
                   tune->result.model.friction * direction +
                   tune->result.model.bias;
-  if (tune->config.load_compensation)
-    current = tune->result.model.viscous * omega; // Load is supplied separately.
   speed->error_sum =
       AutotuneClamp(current, -speed->output_max, speed->output_max) / speed->ki;
   tune->position_pid.reference = position;
   tune->position_pid.previous_reference = position;
   tune->position_pid.feedback = position;
   tune->position_pid.previous_feedback = position;
+}
+
+/**
+ * @brief 清除控制状态并准备重复固定验证轨迹
+ * @param tune 整定对象指针
+ * @param position 当前连续角度（rad）
+ * @param omega 当前角速度（rad/s）
+ */
+static void AutotunePrepare(AutotuneObject *tune, float position, float omega)
+{
+  PidReset(&tune->speed_pid);
+  PidReset(&tune->position_pid);
+  AutotunePrime(tune, position, omega);
+  tune->preparing = true;
+  tune->settling_time = 0.0f;
+  tune->feedforward = 0.0f;
+  if (tune->has_dob)
+  {
+    DobReset(&tune->dob);
+  }
+}
+
+/**
+ * @brief 在固定轨迹下比较有限带宽与阻尼候选
+ * @param tune 整定对象指针
+ * @param position 当前连续角度（rad）
+ * @param omega 当前角速度（rad/s）
+ * @return 是否存在可继续验证的候选
+ */
+static bool AutotuneSearch(AutotuneObject *tune, float position, float omega)
+{
+  static const float scale[3] = {1.0f, 0.6f, 1.6f};
+  float score = tune->result.rms_error + 0.1f * tune->result.peak_error;
+  if (tune->samples > 0U && tune->result.rms_error <= 0.55f &&
+      tune->result.peak_error <= 1.3f && score < tune->best_score)
+  {
+    tune->best_score = score;
+    tune->best_bandwidth = tune->result.bandwidth;
+    tune->best_damping = tune->damping;
+  }
+  tune->search_index++;
+  if (tune->search_index < 6U)
+  {
+    tune->damping = tune->search_index < 3U ? 1.0f : 1.4f;
+    float bandwidth = tune->design_bandwidth * scale[tune->search_index % 3U];
+    AutotuneDesign(tune, fminf(bandwidth, 0.08f / tune->config.sampling_time));
+  }
+  else
+  {
+    if (!isfinite(tune->best_score))
+    {
+      return false;
+    }
+    tune->search_finished = true;
+    tune->damping = tune->best_damping;
+    AutotuneDesign(tune, tune->best_bandwidth);
+  }
+  AutotunePhase(tune, kAutotuneSpeed);
+  AutotunePrepare(tune, position, omega);
+  return true;
 }
 
 /**
@@ -162,31 +217,30 @@ bool AutotuneInit(AutotuneObject *tune, const AutotuneConfig *config)
       !isfinite(config->speed_offset) ||
       fabsf(config->speed_offset) >= 0.7f * config->speed_limit ||
       !isfinite(config->response_time) || config->response_time < 0.0f ||
-      !isfinite(config->speed_damping) ||
-      (config->speed_damping != 0.0f &&
-       (config->speed_damping < 0.2f || config->speed_damping > 3.0f)) ||
-      !isfinite(config->identification_window_time) ||
-      config->identification_window_time < 0.0f ||
-      (config->identification_window_time > 0.0f &&
-       (config->identification_window_time < config->sampling_time ||
-        config->identification_window_time > 0.5f)) ||
+      !isfinite(config->identification_min_speed) ||
+      config->identification_min_speed < 0.0f ||
+      config->identification_min_speed >= config->speed_limit ||
+      config->identification_current_delay_samples > SYSID_MAX_CURRENT_DELAY ||
+      !isfinite(config->identification_window) ||
+      config->identification_window < 0.0f ||
+      (config->identification_window > 0.0f &&
+       (config->identification_window < config->sampling_time ||
+        config->identification_window > 0.1f)) ||
       !isfinite(config->identification_timeout) ||
       (config->identification_timeout != 0.0f &&
-       (config->identification_timeout < 4.0f ||
-        config->identification_timeout > 120.0f)) ||
+       config->identification_timeout < 12.0f) ||
       (config->identification != kSysidExponential &&
        config->identification != kSysidSubspace) ||
-      (config->identification_open_loop && config->speed_offset != 0.0f) ||
-      (config->load_compensation && config->optimize) ||
       (config->tune_position && config->speed_offset != 0.0f))
   {
     return false;
   }
   memset(tune, 0, sizeof(*tune));
   tune->config = *config;
-  if (config->adaptive && config->identification_position_harmonics[0] != 0.0f)
-    return false; // The adaptation API has no position input.
-  return AutotuneIdentifyInit(tune, 0.0f);
+  tune->damping = 1.0f;
+  tune->best_score = INFINITY;
+  AutotuneIdentifyInit(tune, 0.0f);
+  return true;
 }
 
 /**
@@ -211,9 +265,7 @@ bool AutotuneIsActive(const AutotuneObject *tune)
 bool AutotuneStart(AutotuneObject *tune, float position, float omega,
                    const DobObject *dob)
 {
-  if (tune == NULL || AutotuneIsActive(tune) ||
-      (tune->config.load_compensation && dob != NULL && dob->is_enabled) ||
-      !isfinite(position) ||
+  if (tune == NULL || AutotuneIsActive(tune) || !isfinite(position) ||
       !isfinite(omega) || position <= tune->config.position_min ||
       position >= tune->config.position_max ||
       fabsf(omega) > tune->config.speed_limit)
@@ -221,10 +273,14 @@ bool AutotuneStart(AutotuneObject *tune, float position, float omega,
     return false;
   }
   AutotuneConfig config = tune->config;
-  (void)AutotuneInit(tune, &config);
+  if (!AutotuneInit(tune, &config))
+  {
+    return false;
+  }
   tune->center = position;
   tune->random = 0x713AC529U;
   tune->test_amplitude = 0.2f * config.current_limit;
+  tune->excitation_pulse_time = 0.025f;
   tune->has_dob = dob != NULL && dob->is_enabled;
   if (tune->has_dob)
   {
@@ -245,7 +301,6 @@ void AutotuneCancel(AutotuneObject *tune)
   {
     tune->state = kAutotuneCancelled;
     tune->requested_current = 0.0f;
-    tune->load_current = 0.0f;
   }
 }
 
@@ -260,7 +315,6 @@ static float AutotuneFail(AutotuneObject *tune, AutotuneError error)
   tune->state = kAutotuneFailed;
   tune->error = error;
   tune->requested_current = 0.0f;
-  tune->load_current = 0.0f;
   return 0.0f;
 }
 
@@ -276,102 +330,82 @@ static float AutotuneExcite(AutotuneObject *tune, float position, float omega)
   tune->excitation_time += tune->config.sampling_time;
   tune->excitation_peak =
       fmaxf(tune->excitation_peak, fabsf(omega - tune->config.speed_offset));
-  // Brake early enough to leave room for current-loop/CAN delay. Latch the
-  // intervention so crossing one threshold cannot resume the stale pulse.
-  if (tune->config.identification_open_loop &&
-      fabsf(omega) >= 0.6f * tune->config.speed_limit)
+  float minimum_speed = tune->sysid.config.minimum_speed > 0.0f
+                            ? tune->sysid.config.minimum_speed
+                            : 0.01f * tune->config.speed_limit;
+  if (fabsf(omega) >= minimum_speed)
   {
-    tune->excitation_braking = true;
-    tune->excitation_limited = true;
-    tune->excitation_release_time = 0.0f;
-  }
-  if (fabsf(omega - tune->config.speed_offset) > 0.02f * tune->config.speed_limit)
-  {
-    tune->excitation_moving_time += tune->config.sampling_time;
+    tune->excitation_motion_time += tune->config.sampling_time;
+    tune->excitation_direction[omega > 0.0f ? 1U : 0U]++;
   }
   if (tune->excitation_time >= 0.5f)
   {
-    tune->excitation_motion_ratio = tune->excitation_moving_time /
-                                     tune->excitation_time;
-    // A short breakaway/cogging movement is not sustained excitation. A peak
-    // alone used to prevent amplitude growth while the motor spent most of
-    // each pulse at rest. Prioritize backing off at high speed, then require
-    // motion during at least half of the observation interval.
-    if (tune->excitation_limited ||
-        tune->excitation_peak > 0.8f * tune->config.speed_limit)
+    if (tune->excitation_peak > 0.5f * tune->config.speed_limit)
     {
       tune->test_amplitude *= 0.8f;
     }
-    else if (tune->excitation_motion_ratio < 0.5f)
+    else if (tune->excitation_motion_time < 0.25f ||
+             tune->sysid.count - tune->excitation_windows < 8U)
     {
       tune->test_amplitude =
           fminf(1.4f * tune->test_amplitude, 0.7f * tune->config.current_limit);
-    }
-    else if (tune->excitation_peak > 0.5f * tune->config.speed_limit)
-    {
-      tune->test_amplitude *= 0.8f;
+      tune->excitation_pulse_time =
+          fminf(1.25f * tune->excitation_pulse_time, 0.1f);
     }
     tune->excitation_time = 0.0f;
     tune->excitation_peak = 0.0f;
-    tune->excitation_moving_time = 0.0f;
-    tune->excitation_limited = false;
-  }
-  if (tune->excitation_braking)
-  {
-    tune->excitation_limited = true;
-    tune->pulse_ticks = 0U; // Discard, rather than resume, the accelerated pulse.
-    if (fabsf(omega) <= 0.2f * tune->config.speed_limit)
-      tune->excitation_release_time += tune->config.sampling_time;
-    else
-      tune->excitation_release_time = 0.0f;
-    if (tune->excitation_release_time >= 0.02f)
-    {
-      tune->excitation_braking = false;
-      tune->excitation_release_time = 0.0f;
-    }
-    // Taper to zero with speed; a full reverse-current command held near zero
-    // can itself accelerate this low-inertia motor in the opposite direction.
-    return AutotuneClamp(-tune->config.current_limit * omega /
-                             tune->config.speed_limit,
-                         -tune->config.current_limit, tune->config.current_limit);
+    tune->excitation_motion_time = 0.0f;
+    tune->excitation_windows = tune->sysid.count;
   }
   if (tune->pulse_ticks == 0U)
   {
     tune->random ^= tune->random << 13;
     tune->random ^= tune->random >> 17;
     tune->random ^= tune->random << 5;
-    // With a custom integration window, hold each pulse for at least two
-    // windows. Rapid reversals inside a long window cancel useful excitation.
-    // A zero setting preserves the original 25..130 ms excitation sequence.
-    float pulse_base = tune->config.identification_window_time > 0.0f
-                           ? fmaxf(0.025f, 2.0f * tune->sysid.config.window_time)
-                           : 0.025f;
-    float pulse_step = tune->config.identification_window_time > 0.0f
-                           ? fmaxf(0.015f, 0.5f * tune->sysid.config.window_time)
-                           : 0.015f;
-    tune->pulse_ticks =
-        (uint32_t)((pulse_base + pulse_step * (float)(tune->random % 8U)) /
-                   tune->config.sampling_time) +
-        1U;
+    tune->pulse_ticks = (uint32_t)((tune->excitation_pulse_time +
+                                    0.015f * (float)(tune->random % 8U)) /
+                                   tune->config.sampling_time) +
+                        1U;
+    if (tune->config.speed_offset == 0.0f)
+    {
+      if (tune->excitation_direction[0] >
+          2U * tune->excitation_direction[1] + 1U)
+      {
+        tune->random |= 1U;
+      }
+      else if (tune->excitation_direction[1] >
+               2U * tune->excitation_direction[0] + 1U)
+      {
+        tune->random &= ~1U;
+      }
+    }
   }
   tune->pulse_ticks--;
   float span = tune->config.position_max - tune->config.position_min;
-  float request =
-      (tune->random & 1U) != 0U ? tune->test_amplitude : -tune->test_amplitude;
-  if (tune->config.identification_open_loop)
+  float sign = tune->identification_direction == 0U ? 1.0f : -1.0f;
+  float request;
+  if (tune->identification_stage == kAutotuneProbe)
   {
-    // Vary the independent input amplitude as well as its sign. Avoid a
-    // continuously applied -K*omega term in this mode: inverse mechanical RLS
-    // uses omega as a regressor, so speed measurement errors then also drive
-    // the input current and can bias the fitted drag toward the feedback gain.
-    request *= 0.5f + 0.25f * (float)((tune->random >> 1U) % 3U);
+    request = sign * fminf(tune->stage_time / 0.75f, 0.7f) *
+              tune->config.current_limit;
+  }
+  else if (tune->identification_stage == kAutotuneQuasistatic)
+  {
+    float start = tune->startup_current[tune->identification_direction];
+    request = sign * fminf(start + 0.12f * tune->config.current_limit *
+                                       tune->stage_time,
+                           0.7f * tune->config.current_limit);
   }
   else
   {
-    request += 0.4f * tune->config.current_limit *
-               (tune->config.speed_offset - omega) / tune->config.speed_limit;
+    request = (tune->random & 1U) != 0U ? tune->test_amplitude
+                                        : -tune->test_amplitude;
   }
-  if (tune->config.tune_position)
+  request += 0.4f * tune->config.current_limit *
+             (tune->config.speed_offset - omega) / tune->config.speed_limit;
+  // 靠近行程中部时保持试验激励，边缘另行制动。
+  if (tune->config.tune_position &&
+      fabsf(position - tune->center) > 0.3f * span)
   {
     request +=
         1.5f * tune->config.current_limit * (tune->center - position) / span;
@@ -386,9 +420,10 @@ static float AutotuneExcite(AutotuneObject *tune, float position, float omega)
   {
     request = -tune->config.current_limit;
   }
-  if (!tune->config.identification_open_loop &&
-      fabsf(omega) > 0.8f * tune->config.speed_limit)
+  if (fabsf(omega) > 0.8f * tune->config.speed_limit)
+  {
     request = -copysignf(tune->config.current_limit, omega);
+  }
   return request;
 }
 
@@ -451,9 +486,6 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
     return AutotuneFail(tune, kAutotuneMotionLimit);
   }
   float dt = tune->config.sampling_time;
-  float identification_timeout = tune->config.identification_timeout > 0.0f
-                                     ? tune->config.identification_timeout
-                                     : 12.0f;
   if (tune->optimization_pending)
   {
     tune->optimization_pending = false;
@@ -461,47 +493,94 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
         !PidTuneFinish(&tune->optimizer, &tune->speed_pid);
     tune->result.speed_kp = tune->speed_pid.kp;
     tune->result.speed_ki = tune->speed_pid.ki;
-    AutotunePrime(tune, position, omega);
     AutotunePhase(tune, kAutotuneSpeed);
+    AutotunePrepare(tune, position, omega);
   }
   tune->elapsed += dt;
   tune->total_time += dt;
   float request = 0.0f;
-  tune->load_current = 0.0f;
   if (tune->state == kAutotuneIdentify)
   {
-    (void)SysidUpdateWithPosition(&tune->sysid, actual_current, omega, position);
-    if (tune->has_dob)
+    tune->stage_time += dt;
+    float timeout = tune->config.identification_timeout > 0.0f
+                        ? tune->config.identification_timeout
+                        : 20.0f;
+    bool validating = tune->identification_stage == kAutotuneModelValidation;
+    bool window = false;
+    if (validating)
     {
-      (void)SysidUpdateWithPosition(&tune->rotor_sysid, actual_current, rotor_omega, position);
-    }
-    request = AutotuneExcite(tune, position, omega);
-    if (tune->elapsed >= 4.0f)
-    {
-      if (!SysidGetModel(&tune->sysid, &tune->result.model))
-      {
-        if (tune->elapsed < identification_timeout)
-        {
-          tune->requested_current = request;
-          return AutotuneClamp(request, -tune->config.current_limit,
-                               tune->config.current_limit);
-        }
-        return AutotuneFail(tune, kAutotuneInsufficientModel);
-      }
+      (void)SysidPredictionUpdate(&tune->prediction, actual_current, omega);
       if (tune->has_dob)
       {
-        SysidModel rotor_model;
-        if (!SysidGetModel(&tune->rotor_sysid, &rotor_model))
-        {
-          if (tune->elapsed < identification_timeout)
-          {
-            tune->requested_current = request;
-            return AutotuneClamp(request, -tune->config.current_limit,
-                                 tune->config.current_limit);
-          }
-          return AutotuneFail(tune, kAutotuneInsufficientModel);
-        }
+        (void)SysidPredictionUpdate(&tune->rotor_prediction, actual_current,
+                                    rotor_omega);
+      }
+    }
+    else if (tune->identification_stage != kAutotuneProbe)
+    {
+      window = SysidUpdate(&tune->sysid, actual_current, omega);
+      if (tune->has_dob)
+      {
+        (void)SysidUpdate(&tune->rotor_sysid, actual_current, rotor_omega);
+      }
+    }
+    request = AutotuneExcite(tune, position, omega);
+    if (tune->identification_stage == kAutotuneProbe)
+    {
+      float minimum = tune->sysid.config.minimum_speed > 0.0f
+                          ? tune->sysid.config.minimum_speed
+                          : 0.01f * tune->config.speed_limit;
+      uint8_t direction = tune->identification_direction;
+      float sign = direction == 0U ? 1.0f : -1.0f;
+      if (!tune->startup_observed[direction] && sign * omega >= minimum)
+      {
+        tune->startup_observed[direction] = true;
+        tune->startup_current[direction] = fabsf(actual_current);
+      }
+    }
+    if ((tune->identification_stage == kAutotuneProbe &&
+         tune->stage_time >= 0.75f) ||
+        (tune->identification_stage == kAutotuneQuasistatic &&
+         tune->stage_time >= 1.5f))
+    {
+      tune->stage_time = 0.0f;
+      if (++tune->identification_direction == 2U)
+      {
+        tune->identification_direction = 0U;
+        tune->identification_stage++;
+      }
+      SysidResetWindow(&tune->sysid);
+      SysidResetWindow(&tune->rotor_sysid);
+    }
+    if (tune->identification_stage == kAutotuneDynamic &&
+        tune->stage_time >= 4.0f && window &&
+        SysidGetModel(&tune->sysid, &tune->result.model))
+    {
+      SysidModel rotor_model = tune->result.model;
+      bool ready =
+          !tune->has_dob || SysidGetModel(&tune->rotor_sysid, &rotor_model);
+      if (ready &&
+          SysidPredictionInit(&tune->prediction, &tune->sysid.config,
+                              &tune->result.model) &&
+          (!tune->has_dob ||
+           SysidPredictionInit(&tune->rotor_prediction,
+                               &tune->rotor_sysid.config, &rotor_model)))
+      {
         tune->rotor_inertia = rotor_model.inertia;
+        tune->identification_stage = kAutotuneModelValidation;
+        tune->stage_time = 0.0f;
+      }
+    }
+    if (validating && tune->stage_time >= 2.0f)
+    {
+      bool prediction_ok =
+          SysidPredictionGetResult(&tune->prediction, &tune->result.model);
+      SysidModel rotor_model = {0};
+      if (!prediction_ok ||
+          (tune->has_dob &&
+           !SysidPredictionGetResult(&tune->rotor_prediction, &rotor_model)))
+      {
+        return AutotuneFail(tune, kAutotunePredictionError);
       }
       float bandwidth = tune->config.response_time > 0.0f
                             ? 4.0f / tune->config.response_time
@@ -511,6 +590,8 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
                                        (tune->result.model.inertia * 0.12f *
                                         tune->config.speed_limit));
       AutotuneDesign(tune, fmaxf(bandwidth, 0.5f));
+      tune->design_bandwidth = tune->result.bandwidth;
+      tune->test_frequency = 0.25f * tune->result.bandwidth;
       AutotunePrime(tune, position, omega);
       tune->test_amplitude = 0.12f * tune->config.speed_limit;
       if (tune->config.tune_position)
@@ -522,7 +603,13 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
             fminf(tune->test_amplitude, 0.05f * room * tune->result.bandwidth);
       }
       AutotunePhase(tune, kAutotuneSpeed);
+      AutotunePrepare(tune, position, omega);
       request = 0.0f;
+    }
+    if (tune->state == kAutotuneIdentify && tune->elapsed >= timeout)
+    {
+      (void)SysidGetModel(&tune->sysid, &tune->result.model);
+      return AutotuneFail(tune, kAutotuneInsufficientModel);
     }
   }
   else
@@ -530,13 +617,52 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
     bool position_test =
         tune->state == kAutotunePosition ||
         (tune->state == kAutotuneDob && tune->config.tune_position);
-    if (!position_test && tune->validation_frequency <= 0.0f)
-      tune->validation_frequency = 0.25f * tune->result.bandwidth;
-    float frequency = position_test ? 0.35f * tune->result.position_kp
-                                    : tune->validation_frequency;
+    float frequency =
+        position_test ? tune->position_frequency : tune->test_frequency;
     float duration = fmaxf(3.0f, 12.5663706f / fmaxf(frequency, 0.05f));
+    if (tune->preparing)
+    {
+      float target = tune->config.speed_offset;
+      float room = fminf(tune->center - tune->config.position_min,
+                         tune->config.position_max - tune->center);
+      bool centered = !tune->config.tune_position ||
+                      fabsf(position - tune->center) <= 0.005f * room;
+      if (tune->config.tune_position)
+      {
+        target = centered ? 0.0f
+                          : AutotuneClamp(tune->result.position_kp *
+                                              (tune->center - position),
+                                          -0.3f * tune->test_amplitude,
+                                          0.3f * tune->test_amplitude);
+      }
+      request = PidCalculate(&tune->speed_pid, target, omega);
+      if (centered && fabsf(omega - tune->config.speed_offset) <=
+                          0.02f * tune->test_amplitude)
+      {
+        tune->settling_time += dt;
+      }
+      else
+      {
+        tune->settling_time = 0.0f;
+      }
+      if (tune->settling_time >= 0.25f)
+      {
+        tune->preparing = false;
+        tune->elapsed = 0.0f;
+        // 清除敏感度测试的历史，保留静止时已建立的积分电流。
+        tune->speed_pid.previous_reference = omega;
+        tune->speed_pid.previous_feedback = omega;
+      }
+      else if (tune->elapsed > 30.0f + 20.0f / tune->result.position_kp)
+      {
+        return AutotuneFail(tune, kAutotuneTrackingError);
+      }
+      tune->requested_current = request;
+      return AutotuneClamp(request, -tune->config.current_limit,
+                           tune->config.current_limit);
+    }
     if (tune->state == kAutotuneSpeed && tune->config.optimize &&
-        tune->optimizer.state == kPidTuneIdle)
+        tune->search_finished && tune->optimizer.state == kPidTuneIdle)
     {
       PidTuneConfig config = {.model = tune->result.model,
                               .sampling_time = dt,
@@ -556,11 +682,7 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
     float error = reference - omega;
     if (position_test)
     {
-      float room = fminf(tune->center - tune->config.position_min,
-                         tune->config.position_max - tune->center);
-      float amplitude =
-          fminf(0.2f * room, tune->config.speed_limit /
-                                 fmaxf(tune->result.position_kp, 0.01f));
+      float amplitude = tune->position_amplitude;
       reference = tune->center + amplitude * sinf(phase);
       error = reference - position;
       reference = PidCalculate(&tune->position_pid, reference, position);
@@ -573,16 +695,11 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
     {
       AutotuneMeasure(tune, error / fmaxf(tune->test_amplitude, 1.0e-5f));
     }
-    request = tune->state == kAutotuneSpeed && tune->config.optimize
+    request = tune->state == kAutotuneSpeed && tune->config.optimize &&
+                      tune->search_finished
                   ? PidTuneCalculate(&tune->optimizer, &tune->speed_pid,
                                      reference, omega)
                   : PidCalculate(&tune->speed_pid, reference, omega);
-    if (tune->config.load_compensation)
-    {
-      tune->load_current = SysidLoadCurrent(&tune->result.model, position, reference,
-                                            0.01f * tune->config.speed_limit);
-      request += tune->load_current;
-    }
     if (tune->config.adaptive &&
         !(tune->state == kAutotuneSpeed && tune->config.optimize))
     {
@@ -602,6 +719,16 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
     }
     if (tune->elapsed >= duration)
     {
+      if (tune->state == kAutotuneSpeed && !tune->search_finished)
+      {
+        if (!AutotuneSearch(tune, position, omega))
+        {
+          return AutotuneFail(tune, kAutotuneTrackingError);
+        }
+        tune->requested_current = request;
+        return AutotuneClamp(request, -tune->config.current_limit,
+                             tune->config.current_limit);
+      }
       if (tune->samples == 0U || tune->result.rms_error > 0.55f ||
           tune->result.peak_error > 1.3f)
       {
@@ -616,33 +743,18 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
           (void)DobInit(&tune->dob, &config);
           tune->result.dob_cutoff_hz = config.filter_cutoff_hz;
           AutotunePhase(tune, kAutotuneDob);
+          AutotunePrepare(tune, position, omega);
         }
         else if (tune->state == kAutotunePosition)
         {
           tune->result.position_kp *= 0.6f;
           tune->position_pid.kp = tune->result.position_kp;
           AutotunePhase(tune, kAutotunePosition);
+          AutotunePrepare(tune, position, omega);
         }
         else
         {
-          memset(&tune->optimizer, 0, sizeof(tune->optimizer));
-          tune->optimization_finished = false;
-          // Sub-unity fundamental response needs stronger control; amplified
-          // response needs lower gains. Keep the retry trajectory fixed.
-          float amplitude = frequency / 3.14159265f *
-              hypotf(tune->velocity_sine, tune->velocity_cosine);
-          float gain = amplitude / fmaxf(tune->test_amplitude, 1.0e-5f);
-          float bandwidth = gain < 1.0f ? 1.6f * tune->result.bandwidth
-                                        : 0.6f * tune->result.bandwidth;
-          float maximum = fminf(0.08f / dt, 0.4f * tune->config.current_limit /
-              (tune->result.model.inertia * fmaxf(tune->test_amplitude, 1.0e-5f)));
-          AutotuneDesign(tune, fmaxf(0.5f, fminf(bandwidth, maximum)));
-          AutotunePrime(tune, position, omega);
-          if (tune->config.tune_position)
-          {
-            tune->test_amplitude *= 0.6f;
-          }
-          AutotunePhase(tune, kAutotuneSpeed);
+          return AutotuneFail(tune, kAutotuneTrackingError);
         }
       }
       else if (tune->state == kAutotuneSpeed && tune->config.optimize &&
@@ -659,8 +771,15 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
         tune->result.position_kp =
             fminf(tune->result.position_kp, 0.1f / fmaxf(time_constant, dt));
         tune->position_pid.kp = tune->result.position_kp;
+        tune->position_frequency = 0.35f * tune->result.position_kp;
+        float room = fminf(tune->center - tune->config.position_min,
+                           tune->config.position_max - tune->center);
+        tune->position_amplitude =
+            fminf(0.2f * room, tune->config.speed_limit /
+                                   fmaxf(tune->result.position_kp, 0.01f));
         tune->attempt = 0U;
         AutotunePhase(tune, kAutotunePosition);
+        AutotunePrepare(tune, position, omega);
       }
       else if (tune->state != kAutotuneDob && tune->has_dob)
       {
@@ -675,6 +794,7 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
         tune->result.dob_cutoff_hz = config.filter_cutoff_hz;
         tune->attempt = 0U;
         AutotunePhase(tune, kAutotuneDob);
+        AutotunePrepare(tune, position, omega);
       }
       else
       {
@@ -683,7 +803,6 @@ float AutotuneUpdate(AutotuneObject *tune, float position, float omega,
       }
     }
   }
-  if (!isfinite(request)) return AutotuneFail(tune, kAutotuneInvalidSample);
   tune->requested_current = request;
   return AutotuneClamp(request, -tune->config.current_limit,
                        tune->config.current_limit);
@@ -698,7 +817,8 @@ void AutotuneTrackOutput(AutotuneObject *tune, float executed_current)
 {
   if (AutotuneIsActive(tune) && tune->state != kAutotuneIdentify)
   {
-    if (tune->state == kAutotuneSpeed && tune->config.optimize)
+    if (tune->state == kAutotuneSpeed && tune->config.optimize &&
+        tune->search_finished && !tune->preparing)
     {
       PidTuneTrackOutput(&tune->optimizer, executed_current);
     }
@@ -754,20 +874,16 @@ bool AutotuneRestore(AutotuneObject *tune, const SysidModel *model,
                      const PidObject *position, const DobObject *dob)
 {
   if (tune == NULL || model == NULL || speed == NULL ||
-      (tune->config.load_compensation && dob != NULL && dob->is_enabled) ||
       !isfinite(model->inertia) || model->inertia <= 0.0f ||
       !isfinite(model->viscous) || model->viscous < 0.0f ||
-      !isfinite(model->friction) || !isfinite(model->bias) ||
-      !isfinite(model->fitness) || model->fitness < 0.75f ||
-      !isfinite(bandwidth) || bandwidth <= 0.0f || speed->kp <= 0.0f ||
-      speed->ki <= 0.0f || (tune->config.tune_position && position == NULL))
+      !isfinite(model->friction) || model->friction < 0.0f ||
+      !isfinite(model->bias) || !isfinite(model->fitness) ||
+      model->fitness < 0.75f || !isfinite(bandwidth) || bandwidth <= 0.0f ||
+      speed->kp <= 0.0f || speed->ki <= 0.0f ||
+      (tune->config.tune_position && position == NULL))
   {
     return false;
   }
-  for (uint8_t h = 0U; h < SYSID_MAX_POSITION_HARMONICS; h++)
-    if (!isfinite(model->position_sine[h]) || !isfinite(model->position_cosine[h]) ||
-        model->position_harmonics[h] != tune->config.identification_position_harmonics[h])
-      return false;
   tune->result.model = *model;
   tune->validated_model = *model;
   tune->result.bandwidth = bandwidth;
@@ -808,7 +924,6 @@ float AutotuneAdapt(AutotuneObject *tune, PidObject *speed, float omega,
   {
     return 0.0f;
   }
-  if (tune->config.identification_position_harmonics[0] != 0.0f) return 0.0f;
   (void)SysidUpdate(&tune->sysid, actual_current, omega);
   tune->adaptive_time += tune->config.sampling_time;
   if (tune->adaptive_time >= 1.0f)
@@ -820,17 +935,14 @@ float AutotuneAdapt(AutotuneObject *tune, PidObject *speed, float omega,
         model.inertia > 0.5f * tune->validated_model.inertia &&
         model.inertia < 2.0f * tune->validated_model.inertia)
     {
-      float damping = tune->config.speed_damping > 0.0f ? tune->config.speed_damping : 1.0f;
       float kp =
-          fmaxf(2.0f * damping * tune->result.bandwidth * model.inertia - model.viscous,
+          fmaxf(2.0f * tune->damping * tune->result.bandwidth * model.inertia -
+                    model.viscous,
                 0.1f * tune->result.bandwidth * model.inertia);
       float ki =
           model.inertia * tune->result.bandwidth * tune->result.bandwidth;
-      if (tune->config.optimize)
-      {
-        kp *= tune->gain_scale[0];
-        ki *= tune->gain_scale[1];
-      }
+      kp *= tune->gain_scale[0];
+      ki *= tune->gain_scale[1];
       kp = AutotuneClamp(kp, 0.98f * speed->kp, 1.02f * speed->kp);
       ki = AutotuneClamp(ki, 0.98f * speed->ki, 1.02f * speed->ki);
       (void)PidSetGains(speed, kp, ki, 0.0f);

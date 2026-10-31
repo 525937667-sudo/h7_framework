@@ -73,26 +73,18 @@ typedef struct
   float identification_peak_speed;   // Peak |omega| during identification, rad/s.
   float identification_peak_current; // Peak measured |current|, A.
   uint32_t trace_samples;
-  float identification_motion_ratio; // Fraction moving in last 0.5 s interval.
-  uint32_t model_validation_windows;
-  float model_position_span;
+  AutotuneIdentificationStage identification_stage;
+  SysidStatus model_status;
+  float model_validation_fitness;
   AutotuneState baseline_state;
   float validation_rms;
   float validation_peak;
   float speed_reference;
   float pid_current;
-  float load_current;
   uint32_t candidate_index; // Zero-based candidate index, meaningful in search/validation.
   uint32_t segment;
-  MotorTuneState guard_state; // Phase frozen when oscillation protection trips.
-  float guard_rms_speed_error;
-  float guard_rms_current_slew;
-  uint32_t guard_reversals;
-  MotorTuneState stop_state;
   float terminal_position;
   float terminal_omega;
-  bool prepare_braking;
-  float prepare_reference;
 } Gm6020TestStatus;
 
 extern Gm6020TestStatus g_gm6020_test;
@@ -101,8 +93,6 @@ extern DjiMotor g_gm6020_motor;
 extern const MotorTuneConfig g_gm6020_tune_config;
 extern PidConfig g_gm6020_speed_config;
 extern PidConfig g_gm6020_position_config;
-extern SysidModel g_gm6020_load_model;
-extern float g_gm6020_model_origin;
 extern Gm6020TraceSample g_gm6020_trace[GM6020_TRACE_CAPACITY];
 extern uint32_t g_gm6020_trace_count;
 extern volatile uint32_t g_gm6020_trace_version;

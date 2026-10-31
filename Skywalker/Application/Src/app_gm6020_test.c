@@ -32,12 +32,9 @@ const MotorTuneConfig g_gm6020_tune_config = {
             .response_time = 0.2f,
             .tune_position = false,
             .identification = kSysidExponential,
-            .identification_window_time = 0.05f,
+            .identification_window = 0.05f,
             .identification_timeout = 24.0f,
-            .identification_open_loop = true,
-            .identification_position_harmonics = {10.0f, 20.0f, 36.0f},
-            .load_compensation = true,
-            .speed_damping = 3.0f},
+            .identification_min_speed = 0.08f},
   .bandwidth = {.lower = 24.0f, .upper = 72.0f, .count = 3U},
   .damping = {.lower = 1.0f, .upper = 3.0f, .count = 3U},
   .feedforward = {.lower = 0.0f, .upper = 0.0f, .count = 1U},
@@ -49,7 +46,6 @@ const MotorTuneConfig g_gm6020_tune_config = {
   .position_amplitude = 0.35f,
   .segment_time = 1.0f,
   .settling_band = 0.10f,
-  .low_speed_ratio = 0.30f,
 };
 
 Gm6020TestStatus g_gm6020_test;
@@ -57,8 +53,6 @@ MotorTuneObject g_gm6020_tune;
 DjiMotor g_gm6020_motor;
 PidConfig g_gm6020_speed_config;
 PidConfig g_gm6020_position_config;
-SysidModel g_gm6020_load_model;
-float g_gm6020_model_origin;
 Gm6020TraceSample g_gm6020_trace[GM6020_TRACE_CAPACITY];
 uint32_t g_gm6020_trace_count;
 volatile uint32_t g_gm6020_trace_version;
@@ -194,8 +188,6 @@ static void Gm6020TestStartRun(uint32_t now)
   g_gm6020_test.exported = false;
   memset(&g_gm6020_speed_config, 0, sizeof(g_gm6020_speed_config));
   memset(&g_gm6020_position_config, 0, sizeof(g_gm6020_position_config));
-  memset(&g_gm6020_load_model, 0, sizeof(g_gm6020_load_model));
-  g_gm6020_model_origin = s_origin;
   if (!MotorTuneStart(&g_gm6020_tune, 0.0f, g_gm6020_test.omega))
   {
     g_gm6020_test.fault = kGm6020TestInvalidConfig;
@@ -233,6 +225,7 @@ void Gm6020TestLoop(void)
   s_last_loop = now;
   Gm6020TestFeedback(now);
 
+  bool active_on_entry = MotorTuneIsActive(&g_gm6020_tune);
   uint32_t command = g_gm6020_test.command;
   g_gm6020_test.command = kGm6020TestNoCommand;
   if (command == kGm6020TestStop)
@@ -247,9 +240,8 @@ void Gm6020TestLoop(void)
   else if (command == kGm6020TestExport)
   {
     g_gm6020_test.exported = g_gm6020_test.pareto_index < 256U &&
-        MotorTuneExportController(&g_gm6020_tune, (uint8_t)g_gm6020_test.pareto_index,
-                                   &g_gm6020_speed_config, &g_gm6020_position_config,
-                                   &g_gm6020_load_model);
+        MotorTuneExport(&g_gm6020_tune, (uint8_t)g_gm6020_test.pareto_index,
+                        &g_gm6020_speed_config, &g_gm6020_position_config);
     if (!g_gm6020_test.exported)
     {
       g_gm6020_test.fault = kGm6020TestExportFailed;
@@ -342,6 +334,11 @@ void Gm6020TestLoop(void)
   }
 
   g_gm6020_test.active = MotorTuneIsActive(&g_gm6020_tune);
+  if ((was_active || active_on_entry) && !g_gm6020_test.active)
+  {
+    g_gm6020_test.terminal_position = g_gm6020_test.position;
+    g_gm6020_test.terminal_omega = g_gm6020_test.omega;
+  }
   g_gm6020_test.state = g_gm6020_tune.state;
   g_gm6020_test.error = g_gm6020_tune.error;
   g_gm6020_test.identification_error = g_gm6020_tune.baseline.error;
@@ -354,33 +351,19 @@ void Gm6020TestLoop(void)
   if (g_gm6020_tune.baseline.state == kAutotuneIdentify)
     g_gm6020_test.identification_current = g_gm6020_tune.baseline.test_amplitude;
   g_gm6020_test.trace_samples = g_gm6020_trace_count;
-  g_gm6020_test.identification_motion_ratio =
-      g_gm6020_tune.baseline.excitation_motion_ratio;
-  g_gm6020_test.model_validation_windows = g_gm6020_tune.baseline.sysid.validation_count;
-  g_gm6020_test.model_position_span = g_gm6020_tune.baseline.sysid.position_max -
-                                      g_gm6020_tune.baseline.sysid.position_min;
+  g_gm6020_test.identification_stage = g_gm6020_tune.baseline.identification_stage;
+  g_gm6020_test.model_status = g_gm6020_tune.baseline.result.model.status;
+  g_gm6020_test.model_validation_fitness =
+      g_gm6020_tune.baseline.result.model.validation_fitness;
   g_gm6020_test.baseline_state = g_gm6020_tune.baseline.state;
   g_gm6020_test.validation_rms = g_gm6020_tune.baseline.result.rms_error;
   g_gm6020_test.validation_peak = g_gm6020_tune.baseline.result.peak_error;
   bool baseline = g_gm6020_tune.state == kMotorTuneIdentify ||
-                  g_gm6020_tune.error == kMotorTuneBaselineValidationFailed;
+                  g_gm6020_tune.error == kMotorTuneIdentificationFailed;
   g_gm6020_test.speed_reference = baseline ? g_gm6020_tune.baseline.speed_pid.reference
                                            : g_gm6020_tune.speed_pid.reference;
   g_gm6020_test.pid_current = baseline ? g_gm6020_tune.baseline.speed_pid.output
                                        : g_gm6020_tune.speed_pid.output;
-  g_gm6020_test.load_current = g_gm6020_tune.load_current;
   g_gm6020_test.candidate_index = g_gm6020_tune.candidate_index;
   g_gm6020_test.segment = g_gm6020_tune.segment;
-  g_gm6020_test.guard_state = g_gm6020_tune.guard_state;
-  g_gm6020_test.guard_rms_speed_error = g_gm6020_tune.guard_rms_speed_error;
-  g_gm6020_test.guard_rms_current_slew = g_gm6020_tune.guard_rms_current_slew;
-  g_gm6020_test.guard_reversals = g_gm6020_tune.guard_reversals;
-  g_gm6020_test.stop_state = g_gm6020_tune.stop_state;
-  g_gm6020_test.prepare_braking = g_gm6020_tune.prepare_braking;
-  g_gm6020_test.prepare_reference = g_gm6020_tune.prepare_reference;
-  if (!g_gm6020_test.active)
-  {
-    g_gm6020_test.terminal_position = g_gm6020_tune.last_position;
-    g_gm6020_test.terminal_omega = g_gm6020_tune.last_omega;
-  }
 }

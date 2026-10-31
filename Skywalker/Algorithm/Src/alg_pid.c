@@ -189,9 +189,10 @@ float PidCalculate(PidObject *pid_object, float reference, float feedback)
       {
         is_integral_updated = false;
       }
-      // Error sign changes are normal around a quantized setpoint. Retain the
-      // integral load current; antiwindup is handled by saturation above and
-      // final executed-current tracking, not by unconditional zero-cross loss.
+      if (pid_object->error * pid_object->previous_error < 0)
+      {
+        pid_object->error_sum *= 0.90f;
+      }
     }
     if (is_integral_updated)
     {

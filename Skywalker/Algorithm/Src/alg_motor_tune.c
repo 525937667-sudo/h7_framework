@@ -34,20 +34,6 @@ static bool MotorTuneRangeValid(const MotorTuneRange *range, float lower,
 }
 
 /**
- * @brief 读取等间隔搜索点
- * @param range 搜索范围指针
- * @param index 点下标
- * @return 参数值
- */
-static float MotorTuneRangeValue(const MotorTuneRange *range, uint8_t index)
-{
-  return range->count == 1U
-             ? range->lower
-             : range->lower + (range->upper - range->lower) * (float)index /
-                                  (float)(range->count - 1U);
-}
-
-/**
  * @brief 判断整定是否正在接管输出
  * @param tune 整定对象指针
  * @return 是否处于测试阶段
@@ -66,12 +52,10 @@ bool MotorTuneIsActive(const MotorTuneObject *tune)
  */
 static float MotorTuneFail(MotorTuneObject *tune, MotorTuneError error)
 {
-  tune->stop_state = tune->state;
   tune->state = kMotorTuneFailed;
   tune->error = error;
   tune->pending = false;
   tune->requested_current = 0.0f;
-  tune->load_current = 0.0f;
   AutotuneCancel(&tune->baseline);
   return 0.0f;
 }
@@ -101,17 +85,25 @@ bool MotorTuneInit(MotorTuneObject *tune, const MotorTuneConfig *config)
       config->segment_time < 20.0f * config->plant.sampling_time ||
       !isfinite(config->settling_band) || config->settling_band <= 0.0f ||
       config->settling_band >= 0.5f || config->plant.speed_offset != 0.0f ||
-      !isfinite(config->low_speed_ratio) ||
-      (config->low_speed_ratio != 0.0f &&
-       (config->low_speed_ratio < 0.05f || config->low_speed_ratio > 0.5f)))
+      config->objectives > 63U ||
+      config->search_budget > MOTOR_TUNE_MAX_CANDIDATES ||
+      config->validation_repeats > 3U)
   {
     return false;
   }
-  const float limits[] = {
-      config->limits.rms_error,     config->limits.overshoot,
-      config->limits.settling_time, config->limits.idle_ripple,
-      config->limits.rms_slew,      config->limits.saturation};
-  for (uint8_t i = 0U; i < 6U; i++)
+  const float limits[] = {config->limits.rms_error,
+                          config->limits.overshoot,
+                          config->limits.settling_time,
+                          config->limits.idle_ripple,
+                          config->limits.rms_slew,
+                          config->limits.saturation,
+                          config->comparison_tolerance.rms_error,
+                          config->comparison_tolerance.overshoot,
+                          config->comparison_tolerance.settling_time,
+                          config->comparison_tolerance.idle_ripple,
+                          config->comparison_tolerance.rms_slew,
+                          config->comparison_tolerance.saturation};
+  for (uint8_t i = 0U; i < 12U; i++)
   {
     if (!isfinite(limits[i]) || limits[i] < 0.0f)
     {
@@ -131,6 +123,21 @@ bool MotorTuneInit(MotorTuneObject *tune, const MotorTuneConfig *config)
     return false;
   }
   tune->config = *config;
+  if (tune->config.objectives == 0U)
+  {
+    tune->config.objectives =
+        MOTOR_TUNE_OBJECTIVE_ERROR | MOTOR_TUNE_OBJECTIVE_SLEW;
+  }
+  if (tune->config.search_budget == 0U)
+  {
+    tune->config.search_budget = config->bandwidth.count *
+                                 config->damping.count *
+                                 config->feedforward.count;
+  }
+  if (tune->config.validation_repeats == 0U)
+  {
+    tune->config.validation_repeats = 2U;
+  }
   tune->segment_ticks =
       (uint32_t)ceilf(config->segment_time / config->plant.sampling_time);
   tune->initialized = true;
@@ -184,7 +191,6 @@ void MotorTuneCancel(MotorTuneObject *tune)
     tune->state = kMotorTuneCancelled;
     tune->pending = false;
     tune->requested_current = 0.0f;
-    tune->load_current = 0.0f;
   }
 }
 
@@ -206,13 +212,6 @@ static void MotorTuneDesign(const MotorTuneObject *tune,
       ki <= 0.0f || !isfinite(limit / ki))
   {
     candidate->state = kMotorTuneInvalidDesign;
-    candidate->rejection_reasons = kMotorTuneRejectInvalidDesign;
-    return;
-  }
-  if (kp * tune->config.plant.sampling_time / model->inertia > 0.3f)
-  {
-    candidate->state = kMotorTuneDynamicLimit;
-    candidate->rejection_reasons = kMotorTuneRejectDynamicLimit;
     return;
   }
   candidate->speed =
@@ -234,25 +233,61 @@ static void MotorTuneDesign(const MotorTuneObject *tune,
 }
 
 /**
- * @brief 枚举有限物理参数网格
+ * @brief 加入范围内尚未测试的候选
+ * @param tune 整定对象指针
+ * @param value 自然频率、阻尼和前馈比例
+ * @return 是否加入
+ */
+static bool MotorTuneAdd(MotorTuneObject *tune, const float value[3])
+{
+  if (tune->result.candidate_count >= tune->config.search_budget)
+  {
+    return false;
+  }
+  for (uint8_t i = 0U; i < tune->result.candidate_count; i++)
+  {
+    const MotorTuneCandidate *c = &tune->result.candidate[i];
+    if (fabsf(c->bandwidth - value[0]) <= 1.0e-5f * fmaxf(1.0f, value[0]) &&
+        fabsf(c->damping - value[1]) <= 1.0e-5f &&
+        fabsf(c->feedforward - value[2]) <= 1.0e-5f)
+    {
+      return false;
+    }
+  }
+  MotorTuneCandidate *c =
+      &tune->result.candidate[tune->result.candidate_count++];
+  *c = (MotorTuneCandidate){
+      .bandwidth = value[0], .damping = value[1], .feedforward = value[2]};
+  MotorTuneDesign(tune, c);
+  return true;
+}
+
+/**
+ * @brief 生成中心和单轴边界初始候选
  * @param tune 整定对象指针
  */
 static void MotorTuneCandidates(MotorTuneObject *tune)
 {
-  for (uint8_t i = 0U; i < tune->config.bandwidth.count; i++)
+  const MotorTuneRange *range[3] = {&tune->config.bandwidth,
+                                    &tune->config.damping,
+                                    &tune->config.feedforward};
+  float center[3];
+  for (uint8_t d = 0U; d < 3U; d++)
   {
-    for (uint8_t j = 0U; j < tune->config.damping.count; j++)
+    center[d] = 0.5f * (range[d]->lower + range[d]->upper);
+  }
+  (void)MotorTuneAdd(tune, center);
+  for (uint8_t d = 0U; d < 3U; d++)
+  {
+    if (range[d]->count == 1U)
     {
-      for (uint8_t k = 0U; k < tune->config.feedforward.count; k++)
-      {
-        MotorTuneCandidate *candidate =
-            &tune->result.candidate[tune->result.candidate_count++];
-        candidate->bandwidth = MotorTuneRangeValue(&tune->config.bandwidth, i);
-        candidate->damping = MotorTuneRangeValue(&tune->config.damping, j);
-        candidate->feedforward =
-            MotorTuneRangeValue(&tune->config.feedforward, k);
-        MotorTuneDesign(tune, candidate);
-      }
+      continue;
+    }
+    for (uint8_t side = 0U; side < 2U; side++)
+    {
+      float value[3] = {center[0], center[1], center[2]};
+      value[d] = side == 0U ? range[d]->lower : range[d]->upper;
+      (void)MotorTuneAdd(tune, value);
     }
   }
 }
@@ -273,9 +308,6 @@ static void MotorTunePrime(MotorTuneObject *tune, float position, float omega,
   tune->speed_pid.feedback = omega;
   tune->speed_pid.previous_reference = omega;
   tune->speed_pid.previous_feedback = omega;
-  if (tune->config.plant.load_compensation)
-    current -= SysidLoadCurrent(&tune->result.model, position, omega,
-                                 0.01f * tune->config.plant.speed_limit);
   tune->speed_pid.error_sum = MotorTuneClamp(current / tune->speed_pid.ki,
                                              -tune->speed_pid.integral_max,
                                              tune->speed_pid.integral_max);
@@ -283,97 +315,16 @@ static void MotorTunePrime(MotorTuneObject *tune, float position, float omega,
   tune->position_pid.feedback = position;
 }
 
-static float MotorTuneCurrent(MotorTuneObject *tune, float position,
-                               float reference, float omega)
-{
-  float current = PidCalculate(&tune->speed_pid, reference, omega);
-  tune->load_current = tune->config.plant.load_compensation
-      ? SysidLoadCurrent(&tune->result.model, position, reference,
-                          0.01f * tune->config.plant.speed_limit) : 0.0f;
-  return current + tune->load_current;
-}
-
-static void MotorTuneGuardReset(MotorTuneObject *tune)
-{
-  tune->guard_elapsed = 0.0f;
-  tune->guard_sum_speed_error = 0.0f;
-  tune->guard_sum_current_slew = 0.0f;
-  tune->guard_samples = 0U;
-  tune->guard_reversals = 0U;
-  tune->guard_slew_sign = 0;
-  tune->guard_previous_current = tune->executed_current;
-}
-
-// Look for repeated fast current reversals together with poor speed tracking.
-// Run before issuing another command; trip ends the entire test at zero current.
-static bool MotorTuneGuard(MotorTuneObject *tune, float omega)
-{
-  bool baseline = tune->state == kMotorTuneIdentify;
-  if (baseline && tune->baseline.state == kAutotuneIdentify) return false;
-  float dt = tune->config.plant.sampling_time;
-  float reference = baseline ? tune->baseline.speed_pid.reference : tune->speed_pid.reference;
-  float amplitude = baseline ? tune->baseline.test_amplitude : tune->speed_amplitude;
-  float error = reference - omega;
-  float difference = tune->executed_current - tune->guard_previous_current;
-  float slew = difference / dt;
-  tune->guard_previous_current = tune->executed_current;
-  tune->guard_sum_speed_error += error * error;
-  tune->guard_sum_current_slew += slew * slew;
-  tune->guard_samples++;
-  tune->guard_elapsed += dt;
-  if (fabsf(difference) > 0.01f * tune->config.plant.current_limit)
-  {
-    int8_t sign = difference > 0.0f ? 1 : -1;
-    if (tune->guard_slew_sign != 0 && sign != tune->guard_slew_sign)
-      tune->guard_reversals++;
-    tune->guard_slew_sign = sign;
-  }
-  if (tune->guard_elapsed < fmaxf(0.05f, 8.0f * dt)) return false;
-  tune->guard_rms_speed_error = sqrtf(tune->guard_sum_speed_error / tune->guard_samples);
-  tune->guard_rms_current_slew = sqrtf(tune->guard_sum_current_slew / tune->guard_samples);
-  if (tune->guard_reversals >= 4U &&
-      tune->guard_rms_speed_error > 0.5f * amplitude &&
-      tune->guard_rms_current_slew > 100.0f * tune->config.plant.current_limit)
-  {
-    tune->guard_state = tune->state;
-    tune->guard_candidate = tune->candidate_index;
-    tune->guard_segment = tune->segment;
-    if (tune->state == kMotorTuneSearch || tune->state == kMotorTuneValidate)
-    {
-      MotorTuneCandidate *candidate = &tune->result.candidate[tune->candidate_index];
-      tune->metrics.settled = false;
-      tune->metrics.unstable_segments |= (uint16_t)(1U << tune->segment);
-      if (tune->samples > 0U)
-      {
-        tune->metrics.rms_error = sqrtf(tune->sum_error / tune->samples);
-        tune->metrics.rms_slew = sqrtf(tune->sum_slew / tune->samples);
-        tune->metrics.saturation = (float)tune->limited_samples / tune->samples;
-      }
-      if (tune->state == kMotorTuneSearch)
-      {
-        candidate->training = tune->metrics;
-        tune->result.evaluated_count++;
-      }
-      else candidate->validation = tune->metrics;
-      candidate->state = kMotorTuneResponseAborted;
-      candidate->completed_segments = tune->segment;
-      candidate->rejection_reasons = kMotorTuneRejectOscillation;
-    }
-    (void)MotorTuneFail(tune, kMotorTuneOscillationDetected);
-    return true;
-  }
-  MotorTuneGuardReset(tune);
-  return false;
-}
-
 /**
  * @brief 回到统一初始位置再开始下一轮
  * @param tune 整定对象指针
  * @param next 下一测试阶段
  * @param position 当前连续角度（rad）
+ * @param omega 当前角速度（rad/s）
+ * @param current 当前反馈电流（A）
  */
 static void MotorTunePrepare(MotorTuneObject *tune, MotorTuneState next,
-                             float position)
+                             float position, float omega, float current)
 {
   tune->state = kMotorTunePrepare;
   tune->next_state = next;
@@ -381,56 +332,7 @@ static void MotorTunePrepare(MotorTuneObject *tune, MotorTuneState next,
   tune->ready_time = 0.0f;
   tune->speed_pid = tune->baseline.speed_pid;
   tune->position_pid = tune->baseline.position_pid;
-  // A rejected candidate's transient current is not a steady load estimate.
-  // Initialize the baseline from the identified steady model instead.
-  float steady_current =
-      SysidLoadCurrent(&tune->result.model, position, 0.0f,
-                       0.01f * tune->config.plant.speed_limit);
-  MotorTunePrime(tune, position, 0.0f, steady_current);
-  tune->prepare_reference = 0.0f;
-  tune->prepare_zero_time = 0.0f;
-  tune->prepare_braking = true;
-  MotorTuneGuardReset(tune);
-}
-
-static float MotorTunePrepareTolerance(const MotorTuneObject *tune)
-{
-  float room = fminf(tune->center-tune->config.plant.position_min,
-                     tune->config.plant.position_max-tune->center);
-  return tune->config.plant.tune_position
-      ? 0.02f*tune->config.position_amplitude : 0.005f*room;
-}
-
-static float MotorTunePrepareReference(MotorTuneObject *tune, float position, float omega)
-{
-  float dt = tune->config.plant.sampling_time;
-  float frequency = tune->baseline.validation_frequency > 0.0f
-      ? tune->baseline.validation_frequency : 0.25f * tune->baseline.result.bandwidth;
-  float rate = fmaxf(0.1f * tune->config.plant.speed_limit,
-                     tune->baseline.test_amplitude * frequency);
-  if (tune->prepare_braking)
-  {
-    float band = 0.02f * tune->speed_amplitude;
-    if (fabsf(omega) <= band)
-      tune->prepare_zero_time += dt;
-    else tune->prepare_zero_time = 0.0f;
-    if (tune->prepare_zero_time >= 0.05f)
-    {
-      tune->prepare_braking = false;
-      tune->prepare_reference = 0.0f;
-      float steady_current = SysidLoadCurrent(&tune->result.model, position, 0.0f,
-          0.01f*tune->config.plant.speed_limit);
-      MotorTunePrime(tune, position, 0.0f, steady_current);
-    }
-    return 0.0f;
-  }
-  float desired = fabsf(position-tune->center) <= MotorTunePrepareTolerance(tune)
-      ? 0.0f : MotorTuneClamp(
-      tune->baseline.result.position_kp * (tune->center-position),
-      -0.3f*tune->speed_amplitude, 0.3f*tune->speed_amplitude);
-  tune->prepare_reference += MotorTuneClamp(desired-tune->prepare_reference,
-                                           -rate*dt, rate*dt);
-  return tune->prepare_reference;
+  MotorTunePrime(tune, position, omega, current);
 }
 
 /**
@@ -452,7 +354,6 @@ static void MotorTuneBegin(MotorTuneObject *tune, float position, float omega,
     PidInit(&tune->position_pid, &candidate->position);
   }
   MotorTunePrime(tune, position, omega, current);
-  MotorTuneGuardReset(tune);
   tune->metrics = (MotorTuneMetrics){.settled = true};
   tune->tick = 0U;
   tune->segment = 0U;
@@ -476,7 +377,7 @@ static void MotorTuneBegin(MotorTuneObject *tune, float position, float omega,
  */
 static float MotorTuneTarget(const MotorTuneObject *tune)
 {
-  static const float speed[16] = {0.0f, 0.0f, 0.0f, 0.0f,  0.0f, 0.0f,
+  static const float speed[16] = {0.0f, 0.12f, 0.12f, 0.0f,  -0.12f, -0.12f,
                                   1.0f, 1.0f,  -1.0f, -1.0f, 0.0f,   0.0f,
                                   0.0f, 0.0f,  0.0f,  0.0f};
   static const float position[16] = {0.0f, 0.35f, 0.35f, 0.0f,  -0.35f, -0.35f,
@@ -485,10 +386,6 @@ static float MotorTuneTarget(const MotorTuneObject *tune)
   static const float validation[16] = {
       0.0f,  -0.4f,  -0.4f,  0.25f, 0.25f, -0.85f, -0.85f, 0.85f,
       0.85f, -0.25f, -0.25f, 0.4f,  0.4f,  0.0f,   0.0f,   0.0f};
-  float speed_target = speed[tune->segment];
-  float low = tune->config.low_speed_ratio > 0.0f ? tune->config.low_speed_ratio : 0.12f;
-  if (tune->segment == 1U || tune->segment == 2U) speed_target = low;
-  if (tune->segment == 4U || tune->segment == 5U) speed_target = -low;
   if (tune->state == kMotorTuneCharacterize)
   {
     if (tune->position_test)
@@ -496,13 +393,13 @@ static float MotorTuneTarget(const MotorTuneObject *tune)
       static const float hold[4] = {-0.8f, 0.0f, 0.8f, 0.0f};
       return hold[tune->segment - 12U];
     }
-    return speed_target;
+    return speed[tune->segment];
   }
   if (tune->state == kMotorTuneValidate)
   {
     return validation[tune->segment];
   }
-  return tune->position_test ? position[tune->segment] : speed_target;
+  return tune->position_test ? position[tune->segment] : speed[tune->segment];
 }
 
 /**
@@ -524,40 +421,128 @@ static bool MotorTuneFeasible(const MotorTuneObject *tune)
          (l->saturation == 0.0f || m->saturation <= l->saturation);
 }
 
-// These statistics only get worse as segments are added, so a failed bound
-// cannot be repaired by running the rest of the trajectory.
-static uint16_t MotorTuneIrreversibleRejection(const MotorTuneObject *tune)
-{
-  const MotorTuneMetrics *m = &tune->metrics;
-  const MotorTuneLimits *l = &tune->config.limits;
-  uint16_t reasons = 0U;
-  if (!m->settled) reasons |= kMotorTuneRejectUnsettled;
-  if (l->overshoot > 0.0f && m->overshoot > l->overshoot)
-    reasons |= kMotorTuneRejectOvershoot;
-  if (l->settling_time > 0.0f && m->settling_time > l->settling_time)
-    reasons |= kMotorTuneRejectSettlingTime;
-  if (l->idle_ripple > 0.0f && m->idle_ripple > l->idle_ripple)
-    reasons |= kMotorTuneRejectRipple;
-  return reasons;
-}
-
 /**
  * @brief 比较两组性能的帕累托支配关系
+ * @param tune 整定对象指针
  * @param a 第一组性能
  * @param b 第二组性能
  * @return 第一组是否支配第二组
  */
-static bool MotorTuneDominates(const MotorTuneMetrics *a,
+static bool MotorTuneDominates(const MotorTuneObject *tune,
+                               const MotorTuneMetrics *a,
                                const MotorTuneMetrics *b)
 {
-  return a->rms_error <= b->rms_error && a->overshoot <= b->overshoot &&
-         a->settling_time <= b->settling_time &&
-         a->idle_ripple <= b->idle_ripple && a->rms_slew <= b->rms_slew &&
-         a->saturation <= b->saturation &&
-         (a->rms_error < b->rms_error || a->overshoot < b->overshoot ||
-          a->settling_time < b->settling_time ||
-          a->idle_ripple < b->idle_ripple || a->rms_slew < b->rms_slew ||
-          a->saturation < b->saturation);
+  const MotorTuneLimits *t = &tune->config.comparison_tolerance;
+  const float av[6] = {a->rms_error,   a->overshoot, a->settling_time,
+                       a->idle_ripple, a->rms_slew,  a->saturation};
+  const float bv[6] = {b->rms_error,   b->overshoot, b->settling_time,
+                       b->idle_ripple, b->rms_slew,  b->saturation};
+  const float tolerance[6] = {t->rms_error,   t->overshoot, t->settling_time,
+                              t->idle_ripple, t->rms_slew,  t->saturation};
+  bool better = false;
+  for (uint8_t i = 0U; i < 6U; i++)
+  {
+    if ((tune->config.objectives & (1U << i)) == 0U)
+    {
+      continue;
+    }
+    if (av[i] > bv[i])
+    {
+      return false;
+    }
+    better = better || av[i] + tolerance[i] < bv[i];
+  }
+  return better;
+}
+
+/**
+ * @brief 优先细化已验证前沿，无可行点时围绕约束违背最小的候选探索
+ * @param tune 整定对象指针
+ * @return 是否加入下一批候选
+ */
+static bool MotorTuneRefine(MotorTuneObject *tune)
+{
+  if (tune->result.candidate_count >= tune->config.search_budget ||
+      tune->search_round >= 4U)
+  {
+    return false;
+  }
+  uint8_t count = tune->result.candidate_count;
+  uint8_t best = 0U;
+  float violation = INFINITY;
+  const MotorTuneLimits *l = &tune->config.limits;
+  const float limits[6] = {l->rms_error,   l->overshoot, l->settling_time,
+                           l->idle_ripple, l->rms_slew,  l->saturation};
+  for (uint8_t i = 0U; i < count; i++)
+  {
+    const MotorTuneCandidate *c = &tune->result.candidate[i];
+    if (c->state == kMotorTuneInvalidDesign)
+    {
+      continue;
+    }
+    const MotorTuneMetrics *m =
+        c->validation_runs > 0U ? &c->validation : &c->training;
+    const float values[6] = {m->rms_error,   m->overshoot, m->settling_time,
+                             m->idle_ripple, m->rms_slew,  m->saturation};
+    float score = m->settled ? 0.0f : 1.0f;
+    for (uint8_t j = 0U; j < 6U; j++)
+    {
+      if (limits[j] > 0.0f)
+      {
+        score += fmaxf(values[j] / limits[j] - 1.0f, 0.0f);
+      }
+    }
+    if (score < violation)
+    {
+      violation = score;
+      best = i;
+    }
+  }
+  if (!isfinite(violation))
+  {
+    return false;
+  }
+  const MotorTuneRange *range[3] = {&tune->config.bandwidth,
+                                    &tune->config.damping,
+                                    &tune->config.feedforward};
+  float fraction = 0.25f / (float)(1U << tune->search_round++);
+  bool added = false;
+  for (uint8_t i = 0U; i < count; i++)
+  {
+    const MotorTuneCandidate *anchor = &tune->result.candidate[i];
+    bool selected = anchor->state == kMotorTuneVerified;
+    for (uint8_t j = 0U; selected && j < count; j++)
+    {
+      if (tune->result.candidate[j].state == kMotorTuneVerified &&
+          MotorTuneDominates(tune, &tune->result.candidate[j].validation,
+                             &anchor->validation))
+      {
+        selected = false;
+      }
+    }
+    if ((!selected && (tune->result.verified_count > 0U || i != best)))
+    {
+      continue;
+    }
+    float center[3] = {anchor->bandwidth, anchor->damping, anchor->feedforward};
+    for (uint8_t d = 0U; d < 3U; d++)
+    {
+      if (range[d]->count == 1U)
+      {
+        continue;
+      }
+      for (uint8_t side = 0U; side < 2U; side++)
+      {
+        float value[3] = {center[0], center[1], center[2]};
+        value[d] =
+            MotorTuneClamp(center[d] + (side == 0U ? -1.0f : 1.0f) * fraction *
+                                           (range[d]->upper - range[d]->lower),
+                           range[d]->lower, range[d]->upper);
+        added = MotorTuneAdd(tune, value) || added;
+      }
+    }
+  }
+  return added;
 }
 
 /**
@@ -577,7 +562,7 @@ static void MotorTunePareto(MotorTuneObject *tune)
     for (uint8_t j = 0U; j < tune->result.candidate_count; j++)
     {
       if (tune->result.candidate[j].state == kMotorTuneVerified &&
-          MotorTuneDominates(&tune->result.candidate[j].validation,
+          MotorTuneDominates(tune, &tune->result.candidate[j].validation,
                              &tune->result.candidate[i].validation))
       {
         dominated = true;
@@ -603,8 +588,11 @@ static void MotorTunePareto(MotorTuneObject *tune)
  * @brief 选择下一组候选并回到统一初始状态
  * @param tune 整定对象指针
  * @param position 当前连续角度（rad）
+ * @param omega 当前角速度（rad/s）
+ * @param current 当前反馈电流（A）
  */
-static void MotorTuneNext(MotorTuneObject *tune, float position)
+static void MotorTuneNext(MotorTuneObject *tune, float position, float omega,
+                          float current)
 {
   while (tune->candidate_index < tune->result.candidate_count &&
          tune->result.candidate[tune->candidate_index].state !=
@@ -614,10 +602,15 @@ static void MotorTuneNext(MotorTuneObject *tune, float position)
   }
   if (tune->candidate_index == tune->result.candidate_count)
   {
-    MotorTunePareto(tune);
+    if (!MotorTuneRefine(tune))
+    {
+      MotorTunePareto(tune);
+      return;
+    }
+    MotorTuneNext(tune, position, omega, current);
     return;
   }
-  MotorTunePrepare(tune, kMotorTuneSearch, position);
+  MotorTunePrepare(tune, kMotorTuneSearch, position, omega, current);
 }
 
 /**
@@ -709,8 +702,6 @@ static void MotorTuneMeasure(MotorTuneObject *tune, float feedback,
   if (change != 0.0f)
   {
     float overshoot = (feedback - tune->target) / change;
-    if (overshoot > tune->metrics.overshoot)
-      tune->metrics.worst_overshoot_segment = tune->segment;
     tune->metrics.overshoot = fmaxf(tune->metrics.overshoot, overshoot);
   }
   if (fabsf(tune->target - feedback) > tune->config.settling_band * amplitude)
@@ -739,7 +730,6 @@ static void MotorTuneSegmentFinish(MotorTuneObject *tune)
   if (tune->last_outside > duration - 0.1f * duration)
   {
     tune->metrics.settled = false;
-    tune->metrics.unstable_segments |= (uint16_t)(1U << tune->segment);
   }
   if (tune->hold_samples > 1U)
   {
@@ -760,8 +750,11 @@ static void MotorTuneSegmentFinish(MotorTuneObject *tune)
  * @brief 结束包含最终执行量的完整测试窗口
  * @param tune 整定对象指针
  * @param position 当前连续角度（rad）
+ * @param omega 当前角速度（rad/s）
+ * @param current 当前反馈电流（A）
  */
-static void MotorTuneFinish(MotorTuneObject *tune, float position)
+static void MotorTuneFinish(MotorTuneObject *tune, float position, float omega,
+                            float current)
 {
   if (tune->state == kMotorTuneCharacterize)
   {
@@ -783,44 +776,44 @@ static void MotorTuneFinish(MotorTuneObject *tune, float position)
         p->working_gain[i] = tune->working_sum[i] / (float)p->working_count[i];
       }
     }
-    MotorTuneNext(tune, position);
+    MotorTuneNext(tune, position, omega, current);
     return;
   }
-  tune->metrics.rms_error = tune->samples > 0U
-      ? sqrtf(tune->sum_error / (float)tune->samples) : 0.0f;
-  tune->metrics.rms_slew = tune->samples > 0U
-      ? sqrtf(tune->sum_slew / (float)tune->samples) : 0.0f;
-  tune->metrics.saturation = tune->samples > 0U
-      ? (float)tune->limited_samples / (float)tune->samples : 0.0f;
+  tune->metrics.rms_error = sqrtf(tune->sum_error / (float)tune->samples);
+  tune->metrics.rms_slew = sqrtf(tune->sum_slew / (float)tune->samples);
+  tune->metrics.saturation =
+      (float)tune->limited_samples / (float)tune->samples;
   MotorTuneCandidate *candidate =
       &tune->result.candidate[tune->candidate_index];
-  candidate->completed_segments = tune->segment;
-  candidate->rejection_reasons |= MotorTuneIrreversibleRejection(tune);
-  if (tune->config.limits.rms_error > 0.0f &&
-      tune->metrics.rms_error > tune->config.limits.rms_error)
-    candidate->rejection_reasons |= kMotorTuneRejectRms;
-  if (tune->config.limits.rms_slew > 0.0f &&
-      tune->metrics.rms_slew > tune->config.limits.rms_slew)
-    candidate->rejection_reasons |= kMotorTuneRejectSlew;
-  if (tune->config.limits.saturation > 0.0f &&
-      tune->metrics.saturation > tune->config.limits.saturation)
-    candidate->rejection_reasons |= kMotorTuneRejectSaturation;
-  bool feasible = tune->segment == 16U && candidate->rejection_reasons == 0U &&
-                  MotorTuneFeasible(tune);
+  bool feasible = MotorTuneFeasible(tune);
   if (tune->state == kMotorTuneSearch)
   {
     candidate->training = tune->metrics;
     tune->result.evaluated_count++;
     if (feasible)
     {
-      MotorTunePrepare(tune, kMotorTuneValidate, position);
+      MotorTunePrepare(tune, kMotorTuneValidate, position, omega, current);
       return;
     }
     candidate->state = kMotorTuneRejected;
   }
   else
   {
-    candidate->validation = tune->metrics;
+    MotorTuneMetrics *m = &candidate->validation;
+    m->rms_error = fmaxf(m->rms_error, tune->metrics.rms_error);
+    m->overshoot = fmaxf(m->overshoot, tune->metrics.overshoot);
+    m->settling_time = fmaxf(m->settling_time, tune->metrics.settling_time);
+    m->idle_ripple = fmaxf(m->idle_ripple, tune->metrics.idle_ripple);
+    m->rms_slew = fmaxf(m->rms_slew, tune->metrics.rms_slew);
+    m->saturation = fmaxf(m->saturation, tune->metrics.saturation);
+    m->settled = feasible;
+    candidate->validation_runs++;
+    if (feasible &&
+        candidate->validation_runs < tune->config.validation_repeats)
+    {
+      MotorTunePrepare(tune, kMotorTuneValidate, position, omega, current);
+      return;
+    }
     candidate->state =
         feasible ? kMotorTuneVerified : kMotorTuneValidationRejected;
     if (feasible)
@@ -829,7 +822,7 @@ static void MotorTuneFinish(MotorTuneObject *tune, float position)
     }
   }
   tune->candidate_index++;
-  MotorTuneNext(tune, position);
+  MotorTuneNext(tune, position, omega, current);
 }
 
 /**
@@ -847,9 +840,6 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
   {
     return 0.0f;
   }
-  tune->last_position = position;
-  tune->last_omega = omega;
-  tune->last_current = actual_current;
   if (!isfinite(position) || !isfinite(omega) || !isfinite(actual_current))
   {
     return MotorTuneFail(tune, kMotorTuneInvalidSample);
@@ -864,7 +854,6 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
   {
     return MotorTuneFail(tune, kMotorTuneOutputMissing);
   }
-  if (tune->pending && tune->tracked && MotorTuneGuard(tune, omega)) return 0.0f;
   // 当前反馈对应上一周期已执行的参考与电流。
   if (tune->pending && tune->tick > 0U &&
       (tune->state == kMotorTuneCharacterize ||
@@ -882,31 +871,20 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
   }
   tune->pending = false;
   tune->tracked = false;
-  if ((tune->state == kMotorTuneSearch || tune->state == kMotorTuneValidate) &&
-      fabsf(omega) > fabsf(tune->speed_pid.reference) + 2.0f * tune->speed_amplitude)
-  {
-    // A grossly divergent candidate is already unusable. Recover with the
-    // validated baseline now, before it reaches the outer hard speed limit.
-    tune->result.candidate[tune->candidate_index].rejection_reasons |=
-        kMotorTuneRejectTrackingEnvelope;
-    MotorTuneFinish(tune, position);
-    if (!MotorTuneIsActive(tune)) return 0.0f;
-  }
   if (tune->state == kMotorTuneIdentify)
   {
     tune->requested_current =
         AutotuneUpdate(&tune->baseline, position, omega, actual_current, omega);
-    tune->load_current = tune->baseline.load_current;
     if (tune->baseline.state == kAutotuneFailed)
     {
-      return MotorTuneFail(tune, tune->baseline.error == kAutotuneTrackingError
-          ? kMotorTuneBaselineValidationFailed : kMotorTuneIdentificationFailed);
+      return MotorTuneFail(tune, kMotorTuneIdentificationFailed);
     }
     if (tune->baseline.state == kAutotuneComplete)
     {
       tune->result.model = tune->baseline.result.model;
       MotorTuneCandidates(tune);
-      MotorTunePrepare(tune, kMotorTuneCharacterize, position);
+      MotorTunePrepare(tune, kMotorTuneCharacterize, position, omega,
+                       actual_current);
     }
     else
     {
@@ -917,11 +895,9 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
   if (tune->state != kMotorTunePrepare && tune->tick == tune->segment_ticks)
   {
     MotorTuneSegmentFinish(tune);
-    if (tune->segment == 16U ||
-        ((tune->state == kMotorTuneSearch || tune->state == kMotorTuneValidate) &&
-         MotorTuneIrreversibleRejection(tune) != 0U))
+    if (tune->segment == 16U)
     {
-      MotorTuneFinish(tune, position);
+      MotorTuneFinish(tune, position, omega, actual_current);
       if (!MotorTuneIsActive(tune))
       {
         tune->requested_current = 0.0f;
@@ -933,23 +909,17 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
   if (tune->state == kMotorTunePrepare)
   {
     tune->elapsed += dt;
-    float reference = MotorTunePrepareReference(tune, position, omega);
-    if (tune->prepare_braking)
-    {
-      // Decelerate without carrying PI windup or switching Coulomb compensation
-      // to the opposite direction. Only the zero-speed load map is supplied.
-      tune->load_current = SysidLoadCurrent(&tune->result.model, position, 0.0f,
-          0.01f*tune->config.plant.speed_limit);
-      tune->requested_current = tune->load_current -
-          0.5f*tune->config.plant.current_limit*omega/tune->config.plant.speed_limit;
-    }
-    else tune->requested_current = MotorTuneCurrent(tune, position, reference, omega);
-    if (!isfinite(tune->requested_current))
-      return MotorTuneFail(tune, kMotorTuneInvalidSample);
-    float tolerance = MotorTunePrepareTolerance(tune);
-    if (!tune->prepare_braking && fabsf(position - tune->center) <= tolerance &&
-        fabsf(omega) <= 0.02f * tune->speed_amplitude &&
-        fabsf(reference) <= 0.02f * tune->speed_amplitude)
+    float reference = MotorTuneClamp(
+        tune->baseline.result.position_kp * (tune->center - position),
+        -0.3f * tune->speed_amplitude, 0.3f * tune->speed_amplitude);
+    tune->requested_current = PidCalculate(&tune->speed_pid, reference, omega);
+    float room = fminf(tune->center - tune->config.plant.position_min,
+                       tune->config.plant.position_max - tune->center);
+    float tolerance = tune->config.plant.tune_position
+                          ? 0.02f * tune->config.position_amplitude
+                          : 0.005f * room;
+    if (fabsf(position - tune->center) <= tolerance &&
+        fabsf(omega) <= 0.02f * tune->speed_amplitude)
     {
       tune->ready_time += dt;
     }
@@ -998,7 +968,7 @@ float MotorTuneUpdate(MotorTuneObject *tune, float position, float omega,
                         ? PidCalculate(&tune->position_pid,
                                        tune->center + tune->reference, position)
                         : tune->reference;
-  tune->requested_current = MotorTuneCurrent(tune, position, reference, omega);
+  tune->requested_current = PidCalculate(&tune->speed_pid, reference, omega);
   if (!isfinite(tune->requested_current))
   {
     return MotorTuneFail(tune, kMotorTuneInvalidSample);
@@ -1056,21 +1026,18 @@ bool MotorTuneTrackOutput(MotorTuneObject *tune, float executed_current)
 }
 
 /**
- * @brief 导出已独立验证的帕累托候选控制器配置
+ * @brief 导出通过轨迹验证的帕累托候选控制器配置
  * @param tune 整定对象指针
  * @param pareto_index 帕累托集合下标
  * @param speed 速度控制器配置输出指针
  * @param position 位置控制器配置输出指针，速度模式可传NULL
- * @param load_model 负载模型输出；启用load_compensation时必须提供
  * @return 是否成功
  */
-bool MotorTuneExportController(const MotorTuneObject *tune, uint8_t pareto_index,
-                               PidConfig *speed, PidConfig *position,
-                               SysidModel *load_model)
+bool MotorTuneExport(const MotorTuneObject *tune, uint8_t pareto_index,
+                     PidConfig *speed, PidConfig *position)
 {
   if (tune == NULL || speed == NULL || tune->state != kMotorTuneComplete ||
       pareto_index >= tune->result.pareto_count ||
-      (tune->config.plant.load_compensation && load_model == NULL) ||
       (tune->config.plant.tune_position && position == NULL))
   {
     return false;
@@ -1082,12 +1049,5 @@ bool MotorTuneExportController(const MotorTuneObject *tune, uint8_t pareto_index
   {
     *position = candidate->position;
   }
-  if (load_model != NULL) *load_model = tune->result.model;
   return true;
-}
-
-bool MotorTuneExport(const MotorTuneObject *tune, uint8_t pareto_index,
-                     PidConfig *speed, PidConfig *position)
-{
-  return MotorTuneExportController(tune, pareto_index, speed, position, NULL);
 }
