@@ -11,6 +11,7 @@
 #include "app_task.h"
 
 #include "app_config.h"
+#include "app_gm6020_test.h"
 
 /**
  * @brief 初始化管理任务
@@ -42,6 +43,7 @@ uint32_t GimbalTaskInit(void)
  */
 void GimbalTaskLoop(void)
 {
+  Gm6020TestLoop();
 }
 
 /**

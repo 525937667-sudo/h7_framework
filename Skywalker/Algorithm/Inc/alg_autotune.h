@@ -43,6 +43,12 @@ typedef struct
   bool adaptive;              // 正常运行时缓慢更新模型及增益
   SysidMethod identification; // 辨识更新方法
   bool optimize;              // 验证速度环时优化PI性能
+  float identification_window_time; // 辨识积分窗口（s），0沿用20 ms默认值
+  float identification_timeout;     // 辨识等待上限（s），0沿用12 s默认值
+  bool identification_open_loop; // 使用多幅值电流脉冲，取消持续速度反馈制动
+  float identification_position_harmonics[SYSID_MAX_POSITION_HARMONICS];
+  bool load_compensation; // 验证/运行链配套使用已辨识负载电流前馈
+  float speed_damping; // 基准速度PI阻尼比，0沿用1，非零允许0.2至3
 } AutotuneConfig;
 
 // 自动整定结果结构体
@@ -88,6 +94,11 @@ typedef struct
   float rotor_inertia;
   float excitation_time;
   float excitation_peak;
+  float excitation_moving_time;
+  float excitation_motion_ratio;
+  float excitation_release_time;
+  float load_current;
+  float validation_frequency;
   uint32_t samples;
   uint32_t random;
   uint32_t pulse_ticks;
@@ -97,6 +108,8 @@ typedef struct
   bool applied;
   bool optimization_pending;  // 等最终执行量反馈后结束优化窗口
   bool optimization_finished; // 最优增益进入最终验证
+  bool excitation_braking;
+  bool excitation_limited;
 } AutotuneObject;
 
 bool AutotuneInit(AutotuneObject *tune, const AutotuneConfig *config);

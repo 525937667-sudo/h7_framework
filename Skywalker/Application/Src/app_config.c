@@ -6,6 +6,7 @@
  */
 
 #include "app_config.h"
+#include "app_gm6020_test.h"
 
 #include <stddef.h>
 
@@ -60,5 +61,6 @@ const AppShootConfig g_app_shoot_config = {
  */
 void AppConfigInit(void)
 {
+  Gm6020TestInit();
 }
 
