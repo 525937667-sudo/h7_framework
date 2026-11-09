@@ -71,4 +71,6 @@ GitHub Actions 工作流位于 [`.github/workflows/ci.yml`](.github/workflows/ci
 
 ## 测试分支接入
 
+板载 IMU 学习示例见 [喵板 BMI088 与 EKF 逐步讲解](docs/imu-ekf-manager-tutorial.md)：`StartManger` 管理任务自动读取 BMI088 并估计姿态，可在 `g_app_imu.angle_deg` 中观察角度。
+
 本分支保留 [GM6020 空载测试](docs/gm6020-autotune-test.md)，算法以上游 `b3def4b` 为准。上电不自动开始；在调试器中写入 `g_gm6020_test.command = 1` 手动启动。运动教程见 [轨迹教程](docs/motion-trajectory-tutorial.md)。
